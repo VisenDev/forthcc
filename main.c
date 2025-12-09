@@ -7,27 +7,48 @@
 #define streql core_streql
 #define QUIT CORE_FATAL_ERROR
 
+typedef struct SrcInfo SrcInfo;
+struct SrcInfo {
+    SrcInfo * parent;
+    const char * file;
+    long line;
+    long col;
+};
+
+#define DO_TOKENS(x)            \
+    x(TOK_IDENTIFIER)           \
+                                \
+    /*Keywords*/                \
+    x(TOK_INT)                  \
+    x(TOK_RETURN)               \
+                                \
+    /*Syntactic elements*/      \
+    x(TOK_OPEN_PARENS)          \
+    x(TOK_CLOSE_PARENS)         \
+    x(TOK_OPEN_BRACE)           \
+    x(TOK_CLOSE_BRACE)          \
+    x(TOK_PLUS)                 \
+    x(TOK_SEMICOLON)            \
+    x(TOK_COMMA)                
+
+#define ENUM_MEMBER(a) a,
+#define ENUM_NAME(a) #a,
+
 typedef enum {
-    TOK_IDENTIFIER,
-
-    /*Keywords*/
-    TOK_INT,
-    TOK_RETURN,
-
-    /*Syntactic elements*/
-    TOK_OPEN_PARENS,
-    TOK_CLOSE_PARENS,
-    TOK_OPEN_BRACE,
-    TOK_CLOSE_BRACE,
-    TOK_PLUS,
-    TOK_SEMICOLON,
-    TOK_COMMA
-    
+    DO_TOKENS(ENUM_MEMBER)
+    TOK_COUNT
 } TokenTag;
+
+const char * token_tag_names[] = {
+    DO_TOKENS(ENUM_NAME)
+    NULL
+};
 
 typedef struct {
     TokenTag tag;
     const char * identifier;
+
+    SrcInfo src; /*For reporting error messages about where the error came from*/
 } Token;
 
 typedef core_Vec(Token) Tokens;
@@ -56,11 +77,24 @@ void token_fprint(FILE * fp, Token tok) {
 
 void token_print(Token tok) {token_fprint(stdout, tok);}
 
-core_Bool lex_token(core_Arena * a, FILE * fp, Token * result) {
+core_Bool lex_token(core_Arena * a, FILE * fp, Token * result, SrcInfo * src) {
     char ch = 0;
-    core_skip_whitespace(fp);
+
+    while(isspace(core_peek(fp))) {
+        if(core_peek(fp) == '\n') {
+            ++src->line;
+            src->col = 1;
+        } else {
+            ++src->col;
+        }
+        fgetc(fp);
+    }
+
+    result->src = *src;
+
     if(feof(fp)) return CORE_FALSE;
     ch = fgetc(fp);
+    ++src->col;
     
     if(ch == '(') {
         result->tag = TOK_OPEN_PARENS;
@@ -85,6 +119,7 @@ core_Bool lex_token(core_Arena * a, FILE * fp, Token * result) {
             buf[i+1] = 0;
             ++i;
             ch = fgetc(fp);
+            ++src->col;
         }
         ungetc(ch, fp);
         if(streql(buf, "int")) {
@@ -103,8 +138,13 @@ core_Bool lex_token(core_Arena * a, FILE * fp, Token * result) {
 }
 
 Tokens tokenize_file(core_Arena * a, const char * path) {
-   FILE * fp = fopen(path, "r");
+   FILE * fp = NULL;
    Tokens t = {0};
+   SrcInfo src = {0};
+
+   src.file = core_arena_strdup(a, path);
+
+   fp = fopen(path, "r");
    if(!fp) {
        fprintf(stderr, "Failed to open file: '%s'\n", path);
        return t;
@@ -112,7 +152,7 @@ Tokens tokenize_file(core_Arena * a, const char * path) {
 
    while(!feof(fp)) {
        Token tok = {0};
-       if(lex_token(a, fp, &tok)) {
+       if(lex_token(a, fp, &tok, &src)) {
            core_vec_append(&t, a, tok);
        }
    }
@@ -127,15 +167,15 @@ typedef struct {
 } TokenStream;
 
 
-Token * tokenstream_get(TokenStream * s) {
+Token * ts_get(TokenStream * s) {
     if(s->i > s->t.len) return NULL;
     return &s->t.items[s->i];
 }
 
 
-Token * tokenstream_peek(TokenStream * s) {
+Token * ts_peek(TokenStream * s) {
     unsigned long point = s->i;
-    Token * tok = tokenstream_get(s);
+    Token * tok = ts_get(s);
     s->i = point;
     return tok;
 }
@@ -161,7 +201,7 @@ struct Expression {
     union {
         struct {
             Expression * lhs;
-            Expression * rhs
+            Expression * rhs;
         } plus;
         const char * identifier;
     } as;
@@ -195,21 +235,28 @@ typedef struct {
 typedef core_Vec(FunctionParameter) FunctionParameters;
 
 typedef struct {
+    const char * name;
+    TypeSpecifier return_type;
+    FunctionParameters parameters;
+} FunctionPrototype;
+
+typedef struct {
+    FunctionPrototype prototype;
+    Statements * body;
+} FunctionDefinition;
+
+typedef struct {
     ToplevelTag tag;
     union {
-        struct {
-            const char * name;
-            TypeSpecifier return_type;
-            FunctionParameters parameters;
-            Statements body;
-        } function_definition;
+        FunctionDefinition function_definition;
     } as;
 } Toplevel;
 
 typedef core_Vec(Toplevel) Toplevels;
 
 core_Bool parse_type_specifier(TokenStream * s, core_Arena * a, TypeSpecifier * out) {
-    Token * tok = tokenstream_get(s);
+    Token * tok = ts_get(s);
+    (void)a;
     if(tok->tag == TOK_INT) {
         out->tag = TYPE_INT;
     } else {
@@ -218,20 +265,50 @@ core_Bool parse_type_specifier(TokenStream * s, core_Arena * a, TypeSpecifier * 
     return CORE_TRUE;
 }
 
-core_Bool parse_function_parameters();
+core_Bool parse_statement(TokenStream * s, core_Arena * a, Statement * out) {
+    Token * first = ts_get(s);
+    if(!first) QUIT("Expected statement");
+    
+}
 
-core_Bool parse_function_definition(TokenStream * s, core_Arena * a, FunctionDefinition * out) {
-    TypeSpecifier return_type = {0};
-    return_type.tag = TYPE_INT;
+core_Bool parse_function_definition_or_prototype(TokenStream * s, core_Arena * a, FunctionDefinition * out) {
+    Token * name = NULL;
+    Token * parens;
+    core_Bool more_parameters = CORE_TRUE;
+    if(!parse_type_specifier(s, a, &out->prototype.return_type)) return CORE_FALSE;
+    name = ts_get(s);
+    if(!name || name->tag != TOK_IDENTIFIER) CORE_FATAL_ERROR("Expected identifier");
+    out->prototype.name = core_arena_strdup(a, name->identifier);
+    parens = ts_get(s);
+    if(parens->tag != TOK_OPEN_PARENS) CORE_FATAL_ERROR("Expected '('");
+    while(more_parameters) {
+        FunctionParameter param = {0};
+        if(!parse_type_specifier(s, a, &param.type)) CORE_FATAL_ERROR("Expected type specifier");
+        name = ts_get(s);
+        if(!name || name->tag != TOK_IDENTIFIER) CORE_FATAL_ERROR("Expected identifier");
+        param.name = core_arena_strdup(a, name->identifier);
+        core_vec_append(&out->prototype.parameters, a, param);
+        if(ts_peek(s) && ts_peek(s)->tag == TOK_COMMA) 
+            more_parameters = CORE_TRUE; 
+        else more_parameters = CORE_FALSE;;
+    }
+    if(!ts_peek(s)) CORE_FATAL_ERROR("Unexpected EOF");
+    if(ts_get(s)->tag != TOK_CLOSE_PARENS) CORE_FATAL_ERROR("Expected ')'");
 
-    out->return_type = return_type;
-    out->name = core_arena_strdup(a, ident->identifier);
+    if(ts_peek(s) && ts_peek(s)->tag == TOK_SEMICOLON) {
+        out->body = NULL;
+        return CORE_TRUE;
+    }
+
+    if(!ts_peek(s) || ts_get(s)->tag != TOK_OPEN_BRACE) CORE_FATAL_ERROR("Expected '{'");
+    
+    
 }
 
 core_Bool parser_should_parse_declaration(TokenStream * s) {
     /*TODO: make this function more robust*/
     
-    Token * tok = tokenstream_peek(s);
+    Token * tok = ts_peek(s);
     assert(tok);
     if(tok->tag == TOK_INT) return CORE_TRUE;
     return CORE_FALSE;
@@ -241,8 +318,8 @@ core_Bool parse_declaration(TokenStream * s, core_Arena * a, Toplevel * out) {
     long save_point = s->i;
     TypeSpecifier type = {0};
     if(!parse_type_specifier(s, a, &type)) QUIT("Failed to parse declaration type");
-    Token * name = tokenstream_get(s);
-    Token * third = tokenstream_get(s);
+    Token * name = ts_get(s);
+    Token * third = ts_get(s);
     if(third->tag == TOK_OPEN_PARENS) {
         s->i = save_point;
         
